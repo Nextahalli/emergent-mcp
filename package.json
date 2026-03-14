@@ -1,0 +1,25 @@
+{
+  "name": "@openclaw/emergent-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for controlling Emergent.sh via browser automation — create apps, test previews, track credits, and monitor deployments.",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "emergent-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "install-browsers": "npx playwright install chromium",
+    "postinstall": "npx playwright install chromium --with-deps"
+  },
+  "keywords": ["mcp", "emergent", "openclaw", "playwright", "browser-automation", "ai-agent"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "playwright": "^1.42.0"
+  }
+}
