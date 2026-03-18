@@ -4,6 +4,20 @@ MCP server for controlling [Emergent.sh](https://app.emergent.sh) via browser au
 
 ---
 
+## ⚠️ First-Time Setup (Required)
+
+Emergent.sh uses **Cloudflare Turnstile CAPTCHA** on its login form, which blocks automated headless login. You must log in once manually using the login helper:
+
+```bash
+npx emergent-mcp-login
+```
+
+This opens a browser window. Log in however you prefer (Google OAuth, email/password, SSO). The session is saved to `~/.emergent-mcp/session/` and **all future runs work headlessly without re-logging in**.
+
+> If your session expires, just run `npx emergent-mcp-login` again.
+
+---
+
 ## How It Works
 
 Emergent has no public REST API. This server uses **Playwright** (headless Chromium) to drive the Emergent UI exactly as a human would — navigating, clicking, filling inputs, and reading responses. Auth sessions are persisted to `~/.emergent-mcp/session/` so you only log in once.

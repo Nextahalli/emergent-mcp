@@ -75,35 +75,43 @@ export async function listProjects() {
   const page = await getAuthenticatedPage();
 
   try {
-    await page.goto(`${EMERGENT_BASE_URL}/projects`, { waitUntil: 'networkidle' }).catch(() =>
-      page.goto(`${EMERGENT_BASE_URL}/dashboard`, { waitUntil: 'networkidle' })
-    );
+    // Navigate to the root dashboard (Emergent redirects authenticated users here)
+    await page.goto(EMERGENT_BASE_URL, { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
 
-    await page.waitForTimeout(1500);
+    // Dump all debug info if requested
+    if (process.env.EMERGENT_DEBUG) {
+      const { mkdirSync, writeFileSync } = await import('fs');
+      mkdirSync('/tmp/emergent-debug', { recursive: true });
+      await page.screenshot({ path: '/tmp/emergent-debug/list-projects.png', fullPage: true }).catch(() => {});
+      const html = await page.content().catch(() => '');
+      writeFileSync('/tmp/emergent-debug/list-projects.html', html);
+    }
 
+    // Broad selector: find all links that contain /project/ in their href
     const projects = await page.evaluate(() => {
-      const cards = [
-        ...document.querySelectorAll('[data-testid="project-card"]'),
-        ...document.querySelectorAll('.project-card'),
-        ...document.querySelectorAll('a[href*="/project"]'),
-      ];
-
       const seen = new Set();
-      return cards.reduce((acc, el) => {
-        const href = el.href || el.querySelector('a')?.href || '';
-        if (href && !seen.has(href)) {
-          seen.add(href);
-          acc.push({
-            name: el.querySelector('h2, h3, [class*="title"], [class*="name"]')?.textContent?.trim()
-              ?? el.textContent?.trim().slice(0, 60),
-            url: href,
-            id: href.split('/').pop(),
-            lastUpdated: el.querySelector('[class*="date"], [class*="time"], time')?.textContent?.trim() ?? null,
-            status: el.querySelector('[class*="status"], [class*="badge"]')?.textContent?.trim() ?? 'unknown',
-          });
-        }
-        return acc;
-      }, []);
+      const result = [];
+
+      // Try all anchor elements with /project/ in href
+      const anchors = [...document.querySelectorAll('a[href*="/project"]')];
+      for (const el of anchors) {
+        const href = el.href;
+        if (!href || seen.has(href)) continue;
+        seen.add(href);
+
+        const card = el.closest('[class*="card"], [class*="project"], li, article') ?? el;
+        result.push({
+          name: card.querySelector('h2, h3, h4, [class*="title"], [class*="name"]')?.textContent?.trim()
+            ?? el.textContent?.trim().slice(0, 80)
+            ?? 'Unknown',
+          url: href,
+          id: href.split('/project/')[1]?.split('/')[0] ?? href.split('/').pop(),
+          lastUpdated: card.querySelector('[class*="date"], [class*="time"], time, [class*="ago"]')?.textContent?.trim() ?? null,
+          status: card.querySelector('[class*="status"], [class*="badge"]')?.textContent?.trim() ?? 'unknown',
+        });
+      }
+      return result;
     });
 
     return projects;

@@ -4,12 +4,24 @@
  * Maintains a persistent browser context (cookies + localStorage) so the agent
  * doesn't need to re-authenticate on every tool call. Session data is stored in
  * ~/.emergent-mcp/session/ by default, overridable via EMERGENT_SESSION_DIR.
+ *
+ * IMPORTANT: Emergent.sh uses Cloudflare Turnstile CAPTCHA on the login form,
+ * which prevents headless automation of the login step. You MUST log in once
+ * manually using a headful browser:
+ *
+ *   npx emergent-mcp-login
+ *   # or:
+ *   EMERGENT_HEADLESS=false node src/index.js
+ *
+ * After logging in once, the session is saved and all subsequent runs work
+ * headlessly without re-authentication.
  */
 
 import { chromium } from 'playwright';
 import { existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import * as readline from 'readline';
 
 const EMERGENT_BASE_URL = 'https://app.emergent.sh';
 const DEFAULT_TIMEOUT = 30_000;
@@ -17,6 +29,8 @@ const DEFAULT_TIMEOUT = 30_000;
 // Where we persist auth cookies/storage
 const SESSION_DIR = process.env.EMERGENT_SESSION_DIR
   ?? join(homedir(), '.emergent-mcp', 'session');
+
+const storageStatePath = join(SESSION_DIR, 'storage-state.json');
 
 // Singleton state
 let _browser = null;
@@ -29,11 +43,10 @@ let _context = null;
 export async function getContext() {
   if (_context) return _context;
 
-  const headless = process.env.EMERGENT_HEADLESS !== 'false'; // default: headless=true
+  const headless = process.env.EMERGENT_HEADLESS !== 'false';
 
   _browser = await chromium.launch({ headless });
 
-  const storageStatePath = join(SESSION_DIR, 'storage-state.json');
   const ctxOptions = {
     viewport: { width: 1400, height: 900 },
     userAgent:
@@ -43,7 +56,7 @@ export async function getContext() {
 
   _context = await _browser.newContext(ctxOptions);
 
-  // Auto-save session after every navigation so we survive crashes
+  // Auto-save session after every navigation
   _context.on('page', (page) => {
     page.on('load', () => saveSession(_context).catch(() => {}));
   });
@@ -53,7 +66,6 @@ export async function getContext() {
 
 /**
  * Opens a page to Emergent and ensures the user is logged in.
- * If not logged in and credentials are provided in env vars, performs login.
  * Returns the page object.
  */
 export async function getAuthenticatedPage() {
@@ -62,8 +74,8 @@ export async function getAuthenticatedPage() {
   page.setDefaultTimeout(DEFAULT_TIMEOUT);
 
   await page.goto(EMERGENT_BASE_URL, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(1500);
 
-  // Check if we're already authenticated
   const isLoggedIn = await checkLoggedIn(page);
   if (!isLoggedIn) {
     await performLogin(page);
@@ -74,59 +86,46 @@ export async function getAuthenticatedPage() {
 
 /**
  * Checks whether the current page state is authenticated.
+ * Emergent redirects unauthenticated users to /landing/ — that's the reliable signal.
  */
 async function checkLoggedIn(page) {
-  try {
-    const url = page.url();
-    if (url.includes('/login') || url.includes('/signin') || url.includes('/auth')) {
-      return false;
-    }
-    const loggedInIndicator = await page.locator(
-      '[data-testid="user-avatar"], [aria-label*="account"], button:has-text("New Project"), a:has-text("Dashboard")'
-    ).first().isVisible({ timeout: 5000 });
-    return loggedInIndicator;
-  } catch {
-    return false;
-  }
+  const url = page.url();
+  return !url.includes('/landing') && !url.includes('/login') && !url.includes('/signin');
 }
 
 /**
- * Performs email/password login using env vars.
- * Set EMERGENT_EMAIL and EMERGENT_PASSWORD.
+ * Handles login. In headless mode this throws with clear instructions.
+ * In headful mode (EMERGENT_HEADLESS=false), waits for manual login then saves session.
  */
 async function performLogin(page) {
-  const email = process.env.EMERGENT_EMAIL;
-  const password = process.env.EMERGENT_PASSWORD;
+  const headless = process.env.EMERGENT_HEADLESS !== 'false';
 
-  if (!email || !password) {
+  if (headless) {
     throw new Error(
-      'Not logged in to Emergent.sh. Set EMERGENT_EMAIL and EMERGENT_PASSWORD env vars, ' +
-      'or run once with EMERGENT_HEADLESS=false to log in manually and save the session.'
+      'Not logged in to Emergent.sh. Emergent uses Cloudflare Turnstile CAPTCHA which ' +
+      'prevents automated headless login.\n\n' +
+      'Please log in once manually:\n' +
+      '  npx emergent-mcp-login\n\n' +
+      'This opens a browser window for manual login and saves your session for future headless use.\n' +
+      `Session will be stored at: ${storageStatePath}`
     );
   }
 
-  if (!page.url().includes('/login') && !page.url().includes('/signin')) {
-    await page.goto(`${EMERGENT_BASE_URL}/login`, { waitUntil: 'domcontentloaded' }).catch(() =>
-      page.goto(`${EMERGENT_BASE_URL}/signin`, { waitUntil: 'domcontentloaded' })
-    );
-  }
+  // Headful mode: navigate to landing and wait for manual login
+  console.error('[emergent-mcp] Browser opened. Please log in manually in the browser window.');
+  console.error(`[emergent-mcp] Waiting up to 120 seconds for login...`);
 
-  await page.locator('input[type="email"], input[name="email"]').fill(email);
+  await page.goto(`${EMERGENT_BASE_URL}/landing/`, { waitUntil: 'domcontentloaded' });
 
-  const continueBtn = page.locator('button:has-text("Continue"), button:has-text("Next")');
-  if (await continueBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-    await continueBtn.click();
-    await page.waitForTimeout(500);
-  }
+  // Wait until the URL changes away from /landing/
+  await page.waitForURL(
+    (url) => !url.href.includes('/landing') && !url.href.includes('/login') && !url.href.includes('/signin'),
+    { timeout: 120_000 }
+  );
 
-  await page.locator('input[type="password"], input[name="password"]').fill(password);
-  await page.locator('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")').click();
-
-  await page.waitForURL((url) => !url.href.includes('/login') && !url.href.includes('/signin'), {
-    timeout: 15_000,
-  });
-
+  console.error('[emergent-mcp] Login detected. Saving session...');
   await saveSession(_context);
+  console.error(`[emergent-mcp] Session saved to ${storageStatePath}`);
 }
 
 /**
@@ -137,7 +136,7 @@ export async function saveSession(ctx) {
   if (!existsSync(SESSION_DIR)) {
     mkdirSync(SESSION_DIR, { recursive: true });
   }
-  await ctx.storageState({ path: join(SESSION_DIR, 'storage-state.json') });
+  await ctx.storageState({ path: storageStatePath });
 }
 
 /**

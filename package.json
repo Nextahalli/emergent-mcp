@@ -5,7 +5,8 @@
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "emergent-mcp": "src/index.js"
+    "emergent-mcp": "src/index.js",
+    "emergent-mcp-login": "bin/login.mjs"
   },
   "scripts": {
     "start": "node src/index.js",
