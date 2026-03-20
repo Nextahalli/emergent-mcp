@@ -1,194 +1,152 @@
 /**
- * tools/project.js — Create, list, and resume Emergent projects
+ * tools/project.js — Create, list, resume, and monitor Emergent projects
+ *
+ * Uses the Emergent REST API directly (no browser required).
+ * Falls back to browser automation only for operations not yet in the API.
  */
 
-import { getAuthenticatedPage, EMERGENT_BASE_URL } from '../browser.js';
+import {
+  createTask,
+  listJobs,
+  getJob,
+  getPreview,
+  respondToAgent,
+  restartEnvironment,
+  pollUntilDone,
+} from '../api-client.js';
+import { randomUUID } from 'node:crypto';
 
-export async function createProject({ prompt, template = null, visibility = 'private' }) {
-  const page = await getAuthenticatedPage();
+/**
+ * emergent_create_project
+ * Create a new project/app on Emergent.sh by submitting a prompt.
+ *
+ * @param {object} params
+ * @param {string} params.prompt - Full instructions for the AI agent
+ * @param {string} [params.modelName] - Model to use (default: claude-sonnet-4-5)
+ * @param {string} [params.envImage] - Environment image override
+ * @returns {object} { jobId, clientRefId, status, previewUrl }
+ */
+export async function createProject({ prompt, modelName, envImage }) {
+  const clientRefId = randomUUID();
+  const result = await createTask(prompt, clientRefId, { modelName, envImage });
 
+  return {
+    jobId: result.id ?? clientRefId,
+    clientRefId: result.client_ref_id ?? clientRefId,
+    status: result.status,
+    message: result.message,
+  };
+}
+
+/**
+ * emergent_list_projects
+ * List recent Emergent projects/jobs.
+ *
+ * @param {object} params
+ * @param {number} [params.limit=20] - How many to return
+ * @returns {object[]} Array of job summaries
+ */
+export async function listProjects({ limit = 20 } = {}) {
+  const data = await listJobs(limit);
+  const jobs = data.jobs ?? data ?? [];
+  return jobs.map((j) => ({
+    id: j.id,
+    title: j.title,
+    status: j.status,
+    state: j.state,
+    previewUrl: j.preview_url,
+    createdAt: j.created_at,
+    updatedAt: j.updated_at,
+  }));
+}
+
+/**
+ * emergent_get_project
+ * Get full details for a specific project/job.
+ *
+ * @param {object} params
+ * @param {string} params.jobId - Job ID (UUID or short ID)
+ * @returns {object} Full job details
+ */
+export async function getProject({ jobId }) {
+  const job = await getJob(jobId);
+  let preview = null;
   try {
-    await page.goto(EMERGENT_BASE_URL, { waitUntil: 'networkidle' });
-    await page.waitForTimeout(1000);
+    const p = await getPreview(jobId);
+    preview = p.preview_url ?? null;
+  } catch {}
 
-    if (template) {
-      const templateCard = page.locator(
-        `[data-testid="template-card"]:has-text("${template}"), ` +
-        `.template-card:has-text("${template}"), ` +
-        `button:has-text("${template}")`
-      ).first();
-
-      if (await templateCard.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await templateCard.click();
-        await page.waitForTimeout(500);
-      }
-    }
-
-    if (visibility === 'public') {
-      const publicToggle = page.locator(
-        'button:has-text("Public"), [aria-label*="Public"], input[value="public"]'
-      ).first();
-      if (await publicToggle.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await publicToggle.click();
-      }
-    }
-
-    const promptInput = page.locator(
-      'textarea[placeholder*="Describe"], ' +
-      'textarea[placeholder*="What do you want"], ' +
-      'textarea[placeholder*="Build"], ' +
-      'textarea[placeholder*="idea"], ' +
-      '[data-testid="prompt-input"], ' +
-      '.prompt-input textarea, ' +
-      'textarea'
-    ).first();
-
-    await promptInput.waitFor({ state: 'visible', timeout: 10_000 });
-    await promptInput.fill(prompt);
-
-    const submitBtn = page.locator(
-      'button[type="submit"]:visible, ' +
-      'button:has-text("Build"), ' +
-      'button:has-text("Create"), ' +
-      'button:has-text("Generate"), ' +
-      'button:has-text("Start"), ' +
-      '[data-testid="submit-prompt"]'
-    ).first();
-
-    await submitBtn.click();
-
-    await page.waitForURL((url) => url.href.includes('/project') || url.href.includes('/app'), {
-      timeout: 20_000,
-    });
-
-    const projectUrl = page.url();
-    const projectId = extractProjectId(projectUrl);
-    const agentResponse = await waitForAgentResponse(page, { timeout: 60_000 });
-
-    return { projectId, projectUrl, agentResponse };
-  } finally {
-    await page.close();
-  }
+  return {
+    id: job.id,
+    title: job.title,
+    status: job.status,
+    state: job.state,
+    previewUrl: preview,
+    creditsUsed: job.credits_used,
+    createdAt: job.created_at,
+    updatedAt: job.updated_at,
+  };
 }
 
-export async function listProjects() {
-  const page = await getAuthenticatedPage();
-
-  try {
-    // Navigate to the root dashboard (Emergent redirects authenticated users here)
-    await page.goto(EMERGENT_BASE_URL, { waitUntil: 'domcontentloaded' });
-    await page.waitForTimeout(2000);
-
-    // Dump all debug info if requested
-    if (process.env.EMERGENT_DEBUG) {
-      const { mkdirSync, writeFileSync } = await import('fs');
-      mkdirSync('/tmp/emergent-debug', { recursive: true });
-      await page.screenshot({ path: '/tmp/emergent-debug/list-projects.png', fullPage: true }).catch(() => {});
-      const html = await page.content().catch(() => '');
-      writeFileSync('/tmp/emergent-debug/list-projects.html', html);
-    }
-
-    // Broad selector: find all links that contain /project/ in their href
-    const projects = await page.evaluate(() => {
-      const seen = new Set();
-      const result = [];
-
-      // Try all anchor elements with /project/ in href
-      const anchors = [...document.querySelectorAll('a[href*="/project"]')];
-      for (const el of anchors) {
-        const href = el.href;
-        if (!href || seen.has(href)) continue;
-        seen.add(href);
-
-        const card = el.closest('[class*="card"], [class*="project"], li, article') ?? el;
-        result.push({
-          name: card.querySelector('h2, h3, h4, [class*="title"], [class*="name"]')?.textContent?.trim()
-            ?? el.textContent?.trim().slice(0, 80)
-            ?? 'Unknown',
-          url: href,
-          id: href.split('/project/')[1]?.split('/')[0] ?? href.split('/').pop(),
-          lastUpdated: card.querySelector('[class*="date"], [class*="time"], time, [class*="ago"]')?.textContent?.trim() ?? null,
-          status: card.querySelector('[class*="status"], [class*="badge"]')?.textContent?.trim() ?? 'unknown',
-        });
-      }
-      return result;
-    });
-
-    return projects;
-  } finally {
-    await page.close();
-  }
+/**
+ * emergent_respond_to_agent
+ * Respond to a HITL (human-in-the-loop) question from the Emergent agent.
+ * Use this when the agent is waiting for your input to continue building.
+ *
+ * @param {object} params
+ * @param {string} params.jobId - The job waiting for input
+ * @param {string} params.response - Your answer to the agent's question
+ * @returns {object} API response
+ */
+export async function respondToAgentTool({ jobId, response }) {
+  return respondToAgent(jobId, response);
 }
 
-export async function resumeProject({ projectId }) {
-  const page = await getAuthenticatedPage();
-
-  try {
-    const projectUrl = projectId.startsWith('http')
-      ? projectId
-      : `${EMERGENT_BASE_URL}/project/${projectId}`;
-
-    await page.goto(projectUrl, { waitUntil: 'networkidle' });
-    await page.waitForTimeout(1500);
-
-    const currentUrl = page.url();
-    const resolvedId = extractProjectId(currentUrl);
-    const lastAgentMessage = await getLastAgentMessage(page);
-    const hasQuestions = await checkIfAgentWaiting(page);
-
-    return { projectId: resolvedId, projectUrl: currentUrl, lastAgentMessage, hasQuestions };
-  } finally {
-    await page.close();
-  }
+/**
+ * emergent_wake_environment
+ * Wake up a sleeping environment (Emergent sleeps environments after inactivity).
+ *
+ * @param {object} params
+ * @param {string} params.jobId - Job ID
+ * @returns {object} API response
+ */
+export async function wakeEnvironment({ jobId }) {
+  return restartEnvironment(jobId);
 }
 
-export function extractProjectId(url) {
-  const match = url.match(/\/project\/([^/?#]+)|\/app\/([^/?#]+)/);
-  return match?.[1] ?? match?.[2] ?? url.split('/').filter(Boolean).pop();
-}
-
-export async function waitForAgentResponse(page, { timeout = 60_000 } = {}) {
-  const deadline = Date.now() + timeout;
-  const thinkingSelector =
-    '[class*="thinking"], [class*="loading"], [class*="generating"], ' +
-    '[aria-label*="generating"], .spinner, [class*="spinner"]';
-
-  await page.waitForTimeout(2000);
-  await page.locator(thinkingSelector).first().waitFor({ state: 'visible', timeout: 10_000 }).catch(() => {});
-  await page.locator(thinkingSelector).first().waitFor({
-    state: 'hidden',
-    timeout: deadline - Date.now(),
-  }).catch(() => {});
-  await page.waitForTimeout(500);
-
-  return getLastAgentMessage(page);
-}
-
-async function getLastAgentMessage(page) {
-  return page.evaluate(() => {
-    const messageSelectors = [
-      '[data-role="assistant"] .message-content',
-      '[data-sender="agent"] .message-content',
-      '.assistant-message .content',
-      '.agent-message',
-      '[class*="assistant-message"]',
-      '[class*="agent-message"]',
-      '.message:not(.user):last-child',
-    ];
-
-    for (const sel of messageSelectors) {
-      const els = document.querySelectorAll(sel);
-      if (els.length > 0) return els[els.length - 1].textContent?.trim() ?? null;
-    }
-    return null;
+/**
+ * emergent_wait_for_build
+ * Poll a job until it completes (or fails/times out).
+ * Returns the final job status and preview URL.
+ *
+ * @param {object} params
+ * @param {string} params.jobId - Job ID to monitor
+ * @param {number} [params.timeoutMinutes=20] - Max wait time
+ * @returns {object} { jobId, status, previewUrl, creditsUsed }
+ */
+export async function waitForBuild({ jobId, timeoutMinutes = 20 }) {
+  const updates = [];
+  const job = await pollUntilDone(jobId, {
+    timeoutMs: timeoutMinutes * 60 * 1000,
+    onPoll: (j) => {
+      const entry = `${new Date().toISOString().slice(11, 19)} | ${j.status}/${j.state}`;
+      updates.push(entry);
+      console.error(entry); // stderr so it shows in MCP logs
+    },
   });
-}
 
-async function checkIfAgentWaiting(page) {
-  const inputEnabled = await page.locator('textarea:enabled, input[type="text"]:enabled').first()
-    .isVisible({ timeout: 2000 }).catch(() => false);
-  const stillGenerating = await page.locator(
-    '[class*="thinking"], [class*="generating"], .spinner'
-  ).first().isVisible({ timeout: 1000 }).catch(() => false);
-  return inputEnabled && !stillGenerating;
+  let previewUrl = null;
+  try {
+    const p = await getPreview(jobId);
+    previewUrl = p.preview_url ?? null;
+  } catch {}
+
+  return {
+    jobId: job.id,
+    status: job.status,
+    state: job.state,
+    previewUrl,
+    creditsUsed: job.credits_used,
+    statusLog: updates,
+  };
 }

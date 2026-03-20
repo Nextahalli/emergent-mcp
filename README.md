@@ -1,64 +1,33 @@
-# @openclaw/emergent-mcp
+# emergent-mcp
 
-MCP server for controlling [Emergent.sh](https://app.emergent.sh) via browser automation. Lets any MCP-compatible agent (OpenClaw, Claude Code, Claude Desktop) create apps, test previews, track credits, and monitor deployments on Emergent — with no public API required.
+> MCP server for [Emergent.sh](https://emergent.sh) — control the AI-powered full-stack app builder from any MCP-compatible agent.
 
----
+Build apps, monitor progress, respond to agent questions, preview results, and track credit usage — all from your AI assistant.
 
-## ⚠️ First-Time Setup (Required)
-
-Emergent.sh uses **Cloudflare Turnstile CAPTCHA** on its login form, which blocks automated headless login. You must log in once manually using the login helper:
+## Quick Start
 
 ```bash
-npx emergent-mcp-login
-```
-
-This opens a browser window. Log in however you prefer (Google OAuth, email/password, SSO). The session is saved to `~/.emergent-mcp/session/` and **all future runs work headlessly without re-logging in**.
-
-> If your session expires, just run `npx emergent-mcp-login` again.
-
----
-
-## How It Works
-
-Emergent has no public REST API. This server uses **Playwright** (headless Chromium) to drive the Emergent UI exactly as a human would — navigating, clicking, filling inputs, and reading responses. Auth sessions are persisted to `~/.emergent-mcp/session/` so you only log in once.
-
----
-
-## Installation
-
-```bash
-# Run directly (no install needed):
 npx @openclaw/emergent-mcp
-
-# Or install globally:
-npm install -g @openclaw/emergent-mcp
 ```
 
-Playwright installs Chromium automatically via the `postinstall` script.
+**Required env vars:**
 
----
-
-## Authentication
-
-**Option A — Email/Password:**
 ```bash
 export EMERGENT_EMAIL="you@example.com"
 export EMERGENT_PASSWORD="yourpassword"
-npx @openclaw/emergent-mcp
 ```
 
-**Option B — Manual login (Google OAuth, SSO, etc.):**
+Or run the interactive login helper:
+
 ```bash
-EMERGENT_HEADLESS=false npx @openclaw/emergent-mcp
-# A browser window opens. Log in manually. Session is saved automatically.
-# All future runs use the saved session headlessly.
+npx @openclaw/emergent-mcp-login
 ```
 
----
+## Installation
 
-## MCP Client Config
+### Claude Desktop / Claude Code / Cursor
 
-Add to `mcp.json`, Claude Desktop config, or OpenClaw config:
+Add to your MCP config (`claude_desktop_config.json` or `.cursor/mcp.json`):
 
 ```json
 {
@@ -75,82 +44,65 @@ Add to `mcp.json`, Claude Desktop config, or OpenClaw config:
 }
 ```
 
----
+### OpenClaw
 
-## Available Tools (12)
+Add to your OpenClaw config:
+
+```yaml
+mcp:
+  servers:
+    - name: emergent
+      command: npx -y @openclaw/emergent-mcp
+      env:
+        EMERGENT_EMAIL: you@example.com
+        EMERGENT_PASSWORD: yourpassword
+```
+
+## Available Tools
 
 | Tool | Description |
-|---|---|
-| `emergent_create_project` | Start a new app from a prompt |
-| `emergent_send_message` | Send follow-up messages / answer agent questions |
-| `emergent_read_response` | Read full conversation history |
-| `emergent_get_preview_url` | Extract live preview URL + optional screenshot |
-| `emergent_test_preview` | Run automated UI tests against the preview |
-| `emergent_get_credit_info` | Per-project credit usage (via the Info button) |
-| `emergent_get_account_credits` | Total account credits remaining |
-| `emergent_list_projects` | List all projects in the dashboard |
-| `emergent_resume_project` | Open an existing project |
-| `emergent_get_deployment_status` | Deployment status + live URL |
-| `emergent_monitor_deployment` | Poll until a deployment is live |
-| `emergent_discover_features` | Detect new Emergent features + UI changes |
+|------|-------------|
+| `emergent_create_project` | Create a new project by submitting a prompt |
+| `emergent_list_projects` | List recent projects with status |
+| `emergent_get_project` | Get full details for a specific project |
+| `emergent_wait_for_build` | Poll until a build completes |
+| `emergent_respond_to_agent` | Answer a HITL question from the agent |
+| `emergent_wake_environment` | Wake a sleeping environment |
+| `emergent_get_preview` | Get the live preview URL |
+| `emergent_screenshot_preview` | Screenshot preview at phone/tablet/laptop/TV sizes |
+| `emergent_get_credits` | Get full credit balance details |
+| `emergent_credit_summary` | Get a short credit balance string |
 
----
+## Example Usage
+
+Ask your AI assistant:
+
+> "Create a landing page for my coffee shop in Bangalore using emergent-mcp. The shop is called 'Brew & Co', has a 4.9★ rating, and their number is +91 98765 43210. Then take screenshots at phone and laptop sizes."
+
+The agent will:
+1. Call `emergent_get_credits` to note starting balance
+2. Call `emergent_create_project` with your prompt
+3. Call `emergent_wait_for_build` to poll until done
+4. Call `emergent_get_preview` to get the live URL
+5. Call `emergent_screenshot_preview` for the screenshots
+6. Call `emergent_get_credits` again to report credits used
+
+## Architecture
+
+This MCP server uses the **Emergent REST API directly** (no browser automation needed for core operations). Authentication uses the Supabase backend that powers Emergent.
+
+Credentials are cached in `~/.emergent-mcp/api-token.json` and refreshed automatically.
+
+For operations not yet in the REST API (e.g., deployment), the server falls back to Playwright browser automation.
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|---|---|---|
-| `EMERGENT_EMAIL` | — | Account email for login |
-| `EMERGENT_PASSWORD` | — | Account password for login |
-| `EMERGENT_HEADLESS` | `true` | Set to `false` to open a visible browser |
-| `EMERGENT_SESSION_DIR` | `~/.emergent-mcp/session` | Where auth session is saved |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `EMERGENT_EMAIL` | Yes* | Account email |
+| `EMERGENT_PASSWORD` | Yes* | Account password |
 
----
-
-## Project Structure
-
-```
-emergent-mcp/
-├── package.json
-├── SKILL.md              ← OpenClaw skill definition
-├── CLAUDE.md             ← Claude Code context
-├── README.md
-└── src/
-    ├── index.js          ← MCP server entry point + tool registry
-    ├── browser.js        ← Playwright session manager
-    └── tools/
-        ├── project.js    ← create / list / resume
-        ├── chat.js       ← send_message / read_response
-        ├── preview.js    ← get_preview_url / test_preview
-        ├── credits.js    ← get_credit_info / get_account_credits
-        ├── deployment.js ← get_deployment_status / monitor_deployment
-        └── discover.js   ← discover_features
-```
-
----
-
-## Selector Maintenance
-
-Emergent ships features frequently. If a tool fails with selector errors:
-
-1. Run `EMERGENT_HEADLESS=false npx @openclaw/emergent-mcp`
-2. Navigate to the failing area in the visible browser
-3. Use DevTools → Inspector to find updated selectors
-4. Edit the relevant file in `src/tools/`
-
-All selectors use multiple fallbacks (`data-testid` → class patterns → text content), so partial UI changes often work without any changes.
-
-Run `emergent_discover_features({ forceRefresh: true })` to get a fresh snapshot of what's on the Emergent UI before debugging selectors.
-
----
-
-## Contributing
-
-PRs updating selectors, adding new tool capabilities as Emergent ships features, or improving test coverage are very welcome.
-
-When Emergent releases a public API, tools should be updated to use REST calls — the MCP tool interface stays the same, only the implementation changes.
-
----
+*Not required if you've already logged in via `emergent-mcp-login` (session cached).
 
 ## License
 
