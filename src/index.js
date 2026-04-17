@@ -3,7 +3,9 @@
  * src/index.js — Emergent.sh MCP Server
  *
  * Exposes all Emergent automation tools to any MCP-compatible client
- * (OpenClaw, Claude Code, Claude Desktop, etc.) over stdio.
+ * (OpenClaw, Claude Code, Claude Desktop, Cursor, etc.) over stdio.
+ *
+ * Uses the Emergent REST API directly — no browser needed for most operations.
  *
  * Usage:
  *   EMERGENT_EMAIL=you@example.com EMERGENT_PASSWORD=secret npx @openclaw/emergent-mcp
@@ -32,238 +34,212 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { closeBrowser } from './browser.js';
-import { createProject, listProjects, resumeProject } from './tools/project.js';
-import { sendMessage, readResponse } from './tools/chat.js';
-import { getPreviewUrl, testPreview } from './tools/preview.js';
-import { getCreditInfo, getAccountCredits } from './tools/credits.js';
-import { getDeploymentStatus, monitorDeployment } from './tools/deployment.js';
+// API-based tools (no browser needed)
+import { createProject, listProjects, getProject, respondToAgentTool, wakeEnvironment, waitForBuild } from './tools/project.js';
+import { getPreviewUrl, screenshotPreview } from './tools/preview.js';
+import { getCredits, getCreditSummary } from './tools/credits.js';
+
+// Browser-based tools (fallback for unsupported API operations)
+import { getDeploymentStatus } from './tools/deployment.js';
 import { discoverFeatures } from './tools/discover.js';
+import { closeBrowser } from './browser.js';
 
 const TOOLS = [
+  // ── Project Management ────────────────────────────────────────────────────
   {
     name: 'emergent_create_project',
     description:
-      'Create a new Emergent.sh project. Navigates to the home screen, selects configuration, ' +
-      'submits the first prompt, and returns the project URL and the agent\'s first response.',
+      'Create a new project on Emergent.sh by submitting a prompt. ' +
+      'The AI agent will start building immediately. Returns a job ID you can use to monitor progress.',
     inputSchema: {
       type: 'object',
       properties: {
-        prompt: { type: 'string', description: 'Initial prompt describing what to build' },
-        template: { type: 'string', description: 'Optional template name (e.g. "React App", "Landing Page")' },
-        visibility: { type: 'string', enum: ['public', 'private'], description: 'Project visibility (default: private)' },
+        prompt: {
+          type: 'string',
+          description: 'Full instructions for what to build. Be specific — include design requirements, tech stack preferences, data structures, and any constraints.',
+        },
+        modelName: {
+          type: 'string',
+          description: 'AI model to use (default: claude-sonnet-4-5)',
+          enum: ['claude-sonnet-4-5', 'claude-sonnet-4-6', 'claude-opus-4', 'gpt-4o'],
+        },
       },
       required: ['prompt'],
     },
   },
   {
-    name: 'emergent_send_message',
-    description:
-      'Send a follow-up message in an existing Emergent project chat. Use this to answer the agent\'s ' +
-      'questions, give clarifications, or request changes. Returns the agent\'s reply.',
+    name: 'emergent_list_projects',
+    description: 'List your recent Emergent.sh projects/jobs with their status and preview URLs.',
     inputSchema: {
       type: 'object',
       properties: {
-        projectId: { type: 'string', description: 'Project ID or full project URL' },
-        message: { type: 'string', description: 'Message to send to the Emergent agent' },
-        waitForResponse: { type: 'boolean', description: 'Wait for and return the agent\'s reply (default: true)' },
+        limit: { type: 'number', description: 'Max results to return (default: 20)' },
       },
-      required: ['projectId', 'message'],
     },
   },
   {
-    name: 'emergent_read_response',
-    description:
-      'Read the full conversation history of an Emergent project. Returns all messages with roles, ' +
-      'whether the agent is still generating, and whether it has open questions.',
+    name: 'emergent_get_project',
+    description: 'Get full details for a specific project including status, preview URL, and credits used.',
     inputSchema: {
       type: 'object',
       properties: {
-        projectId: { type: 'string', description: 'Project ID or full project URL' },
-        lastN: { type: 'number', description: 'Only return the last N messages (default: all)' },
+        jobId: { type: 'string', description: 'Job ID (UUID)' },
       },
-      required: ['projectId'],
+      required: ['jobId'],
     },
   },
   {
-    name: 'emergent_get_preview_url',
+    name: 'emergent_wait_for_build',
     description:
-      'Extracts the live preview URL from an Emergent project. Tries iframe first, then external tab links. ' +
-      'Optionally captures a screenshot of the preview.',
+      'Poll a job until it completes (or fails/times out). ' +
+      'Use after emergent_create_project to wait for the build to finish.',
     inputSchema: {
       type: 'object',
       properties: {
-        projectId: { type: 'string', description: 'Project ID or full project URL' },
-        captureScreenshot: { type: 'boolean', description: 'Capture and return a base64 screenshot (default: true)' },
+        jobId: { type: 'string', description: 'Job ID to monitor' },
+        timeoutMinutes: { type: 'number', description: 'Max wait time in minutes (default: 20)' },
       },
-      required: ['projectId'],
+      required: ['jobId'],
     },
   },
   {
-    name: 'emergent_test_preview',
+    name: 'emergent_respond_to_agent',
     description:
-      'Run automated UI tests against the Emergent preview of a project. Specify test scenarios ' +
-      'or use built-in smoke tests. Returns pass/fail results per test.',
+      'Respond to a HITL (human-in-the-loop) question from the Emergent agent. ' +
+      'Use when the agent has paused and is waiting for your input to continue building.',
     inputSchema: {
       type: 'object',
       properties: {
-        projectId: { type: 'string', description: 'Project ID or full project URL' },
-        previewUrl: { type: 'string', description: 'Override — use this URL directly instead of fetching from project' },
-        tests: {
+        jobId: { type: 'string', description: 'Job ID of the paused build' },
+        response: { type: 'string', description: 'Your answer to the agent\'s question' },
+      },
+      required: ['jobId', 'response'],
+    },
+  },
+  {
+    name: 'emergent_wake_environment',
+    description: 'Wake up a sleeping Emergent environment (auto-sleeps after ~30min inactivity).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: { type: 'string', description: 'Job ID of the sleeping environment' },
+      },
+      required: ['jobId'],
+    },
+  },
+
+  // ── Preview ───────────────────────────────────────────────────────────────
+  {
+    name: 'emergent_get_preview',
+    description: 'Get the live preview URL for a built Emergent project.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: { type: 'string', description: 'Job ID' },
+        includeVscode: { type: 'boolean', description: 'Also return VS Code editor URL' },
+      },
+      required: ['jobId'],
+    },
+  },
+  {
+    name: 'emergent_screenshot_preview',
+    description:
+      'Take screenshots of the live preview at multiple viewport sizes (phone, tablet, laptop, TV). ' +
+      'Requires Playwright (installed automatically with the package).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        previewUrl: { type: 'string', description: 'Preview URL to screenshot' },
+        outputDir: { type: 'string', description: 'Directory to save screenshots (default: /tmp)' },
+        viewports: {
           type: 'array',
-          description: 'Test scenarios to run. Leave empty for default smoke tests.',
-          items: {
-            type: 'object',
-            properties: {
-              description: { type: 'string' },
-              action: { type: 'string', enum: ['click', 'fill', 'check_text', 'check_visible', 'screenshot', 'navigate', 'check_no_error'] },
-              selector: { type: 'string' },
-              value: { type: 'string' },
-              waitFor: { type: 'string' },
-            },
-            required: ['description', 'action'],
-          },
+          items: { type: 'string', enum: ['phone', 'tablet', 'laptop', 'tv'] },
+          description: 'Viewport sizes to capture (default: [phone, laptop])',
         },
       },
-      required: ['projectId'],
+      required: ['previewUrl'],
     },
+  },
+
+  // ── Credits ───────────────────────────────────────────────────────────────
+  {
+    name: 'emergent_get_credits',
+    description:
+      'Get the current credit balance for the Emergent account. ' +
+      'Returns ECU balance, monthly credits, daily credits, plan name, and refresh date.',
+    inputSchema: { type: 'object', properties: {} },
   },
   {
-    name: 'emergent_get_credit_info',
-    description:
-      'Check the credit usage for a specific Emergent project. Clicks the info/credits button ' +
-      'in the project view and returns consumption details.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        projectId: { type: 'string', description: 'Project ID or full project URL' },
-      },
-      required: ['projectId'],
-    },
+    name: 'emergent_credit_summary',
+    description: 'Get a short human-readable credit balance summary.',
+    inputSchema: { type: 'object', properties: {} },
   },
-  {
-    name: 'emergent_get_account_credits',
-    description:
-      'Check the total credits remaining in the Emergent account, the plan type, and overall usage. ' +
-      'Use this before starting expensive projects to verify sufficient budget.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-  {
-    name: 'emergent_list_projects',
-    description:
-      'List all projects in the Emergent account dashboard. Returns project names, IDs, URLs, ' +
-      'last-updated timestamps, and status.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-  {
-    name: 'emergent_resume_project',
-    description:
-      'Open an existing Emergent project and return its current state — the last agent message, ' +
-      'whether there are open questions, and the project URL.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        projectId: { type: 'string', description: 'Project ID or full project URL' },
-      },
-      required: ['projectId'],
-    },
-  },
-  {
-    name: 'emergent_get_deployment_status',
-    description:
-      'Check the deployment status of an Emergent project. Returns the live URL (if deployed), ' +
-      'build status, deploy timestamp, and optionally pings the live URL to confirm it\'s responding.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        projectId: { type: 'string', description: 'Project ID or full project URL' },
-        pingDeployment: { type: 'boolean', description: 'Ping the deployed URL to verify it\'s alive (default: true)' },
-      },
-      required: ['projectId'],
-    },
-  },
-  {
-    name: 'emergent_monitor_deployment',
-    description:
-      'Poll a deployed URL repeatedly until it comes up, with configurable interval and timeout. ' +
-      'Use after triggering a deployment to watch for when it goes live.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        deployedUrl: { type: 'string', description: 'The URL to monitor' },
-        pollIntervalMs: { type: 'number', description: 'How often to check in milliseconds (default: 10000)' },
-        timeoutMs: { type: 'number', description: 'Total monitoring time in milliseconds (default: 120000)' },
-        expectText: { type: 'string', description: 'Optional text to wait for on the page (confirms correct app loaded)' },
-      },
-      required: ['deployedUrl'],
-    },
-  },
+
+  // ── Discovery (browser-based fallback) ───────────────────────────────────
   {
     name: 'emergent_discover_features',
     description:
-      'Scrape the Emergent platform to discover new features, UI options, templates, and capabilities. ' +
-      'Diffs against the previous known state so you can adapt to platform changes. ' +
-      'Run this at the start of a session to ensure you\'re using the latest Emergent capabilities.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        forceRefresh: { type: 'boolean', description: 'Ignore cache and re-scrape (default: false)' },
-      },
-    },
+      '[Browser] Discover and document available Emergent.sh features. ' +
+      'Only needed for features not yet in the REST API.',
+    inputSchema: { type: 'object', properties: {} },
   },
 ];
 
-const TOOL_HANDLERS = {
-  emergent_create_project: createProject,
-  emergent_send_message: sendMessage,
-  emergent_read_response: readResponse,
-  emergent_get_preview_url: getPreviewUrl,
-  emergent_test_preview: testPreview,
-  emergent_get_credit_info: getCreditInfo,
-  emergent_get_account_credits: getAccountCredits,
-  emergent_list_projects: listProjects,
-  emergent_resume_project: resumeProject,
-  emergent_get_deployment_status: getDeploymentStatus,
-  emergent_monitor_deployment: monitorDeployment,
-  emergent_discover_features: discoverFeatures,
-};
+// ─── Tool Dispatch ────────────────────────────────────────────────────────────
+
+async function callTool(name, args) {
+  switch (name) {
+    case 'emergent_create_project':     return createProject(args);
+    case 'emergent_list_projects':      return listProjects(args);
+    case 'emergent_get_project':        return getProject(args);
+    case 'emergent_wait_for_build':     return waitForBuild(args);
+    case 'emergent_respond_to_agent':   return respondToAgentTool(args);
+    case 'emergent_wake_environment':   return wakeEnvironment(args);
+    case 'emergent_get_preview':        return getPreviewUrl(args);
+    case 'emergent_screenshot_preview': return screenshotPreview(args);
+    case 'emergent_get_credits':        return getCredits();
+    case 'emergent_credit_summary':     return getCreditSummary();
+    case 'emergent_discover_features':  return discoverFeatures({});
+    default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
+  }
+}
+
+// ─── MCP Server Setup ─────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'emergent-mcp', version: '0.1.0' },
+  { name: 'emergent-mcp', version: '0.2.0' },
   { capabilities: { tools: {} } }
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args = {} } = request.params;
-
-  const handler = TOOL_HANDLERS[name];
-  if (!handler) {
-    throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
-  }
+  const { name, arguments: args } = request.params;
 
   try {
-    const result = await handler(args);
+    const result = await callTool(name, args ?? {});
     return {
-      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      content: [
+        {
+          type: 'text',
+          text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
+        },
+      ],
     };
   } catch (err) {
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ error: err.message, tool: name }) }],
-      isError: true,
-    };
+    if (err instanceof McpError) throw err;
+    throw new McpError(
+      ErrorCode.InternalError,
+      `${name} failed: ${err.message}`,
+    );
   }
+});
+
+process.on('SIGINT', async () => {
+  await closeBrowser().catch(() => {});
+  process.exit(0);
 });
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-
-process.on('SIGINT', async () => { await closeBrowser(); process.exit(0); });
-process.on('SIGTERM', async () => { await closeBrowser(); process.exit(0); });
+console.error('emergent-mcp v0.2.0 started (API-first mode)');
